@@ -1,5 +1,11 @@
+"""LangGraph orchestrator for the multi-agent CRM assistant."""
+
+from __future__ import annotations
+
 import json
-from typing import Any, AsyncIterator, Dict, List
+from typing import Any, AsyncIterator, Dict, List, Literal, Optional, TypedDict
+
+from langgraph.graph import END, START, StateGraph
 
 from app.database.redis_client import cache_get, cache_set
 from app.helpers.agents.crm_actions import (
@@ -24,6 +30,22 @@ from app.models.crm import Customer
 from app.models.user import User
 
 
+class AgentGraphState(TypedDict):
+    user: User
+    query: str
+    effective_query: str
+    memory: Dict[str, Any]
+    classification: Optional[Dict[str, Any]]
+    action_result: Optional[Dict[str, Any]]
+    response: str
+    agent: str
+    intent: str
+    citations: List[Dict[str, Any]]
+    orchestration: Dict[str, str]
+    actions: List[str]
+    routing: str
+
+
 async def _remember_entity(user_id: int, entity: Dict[str, Any]) -> None:
     if entity:
         await cache_set(f"chat:memory:{user_id}", json.dumps(entity), ttl=86400)
@@ -39,6 +61,10 @@ async def _get_memory(user_id: int) -> Dict[str, Any]:
     return {}
 
 
+def _llm_unconfigured(text: str) -> bool:
+    return text.startswith("AI response (configure OPENAI_API_KEY") or text.startswith("LLM error")
+
+
 async def _try_crm_action(user: User, query: str) -> Dict[str, Any] | None:
     action_result = await execute_crm_action(user, query)
     if action_result:
@@ -48,10 +74,6 @@ async def _try_crm_action(user: User, query: str) -> Dict[str, Any] | None:
             await _remember_entity(user.id, action_result["entity"])
         return action_result
     return None
-
-
-def _llm_unconfigured(text: str) -> bool:
-    return text.startswith("AI response (configure OPENAI_API_KEY") or text.startswith("LLM error")
 
 
 async def _run_crm_agent(user: User, query: str, memory: Dict[str, Any]) -> str:
@@ -190,11 +212,24 @@ async def _gather_orchestration_context(
     return ctx
 
 
-async def run_agent_graph(user: User, query: str) -> Dict[str, Any]:
-    """Multi-agent router with LLM intent classification and orchestration."""
-    citations: List[Dict[str, Any]] = []
+def _action_response(state: AgentGraphState, routing: str) -> AgentGraphState:
+    action_result = state["action_result"]
+    if not action_result:
+        return state
+    return {
+        **state,
+        "response": action_result["response"],
+        "agent": "crm",
+        "intent": action_result.get("action", "crm"),
+        "actions": [action_result.get("action")] if action_result.get("action") else [],
+        "routing": routing,
+    }
+
+
+async def _node_prepare(state: AgentGraphState) -> AgentGraphState:
+    user = state["user"]
+    query = state["query"]
     memory = await _get_memory(user.id)
-    actions_taken: List[str] = []
 
     effective_query = query
     if is_confirmation(query):
@@ -204,77 +239,103 @@ async def run_agent_graph(user: User, query: str) -> Dict[str, Any]:
 
     await remember_pending_action(user.id, query if not is_confirmation(query) else effective_query)
 
+    return {
+        **state,
+        "memory": memory,
+        "effective_query": effective_query,
+        "citations": [],
+        "orchestration": {},
+        "actions": [],
+        "response": "",
+        "agent": "",
+        "intent": "",
+        "routing": "",
+        "classification": None,
+        "action_result": None,
+    }
+
+
+async def _node_crm_fast_path(state: AgentGraphState) -> AgentGraphState:
+    user = state["user"]
+    query = state["query"]
+    effective_query = state["effective_query"]
+
     action_result = await _try_crm_action(user, effective_query)
     if not action_result and is_confirmation(query):
         action_result = await _try_crm_action(user, query)
 
-    if action_result:
-        return {
-            "response": action_result["response"],
-            "agent": "crm",
-            "intent": action_result.get("action", "crm"),
-            "citations": citations,
-            "context": {
-                "user_id": user.id,
-                "memory": memory,
-                "action": action_result.get("action"),
-                "success": action_result.get("success"),
-                "routing": "crm_action_fast_path",
-            },
-            "actions": [action_result.get("action")] if action_result.get("action") else [],
-        }
+    return {**state, "action_result": action_result}
 
-    classification = await classify_intent(query, memory)
 
-    if classification.crm_action and classification.primary_agent == "crm":
-        action_result = await _try_crm_action(user, query)
+def _route_after_fast_path(state: AgentGraphState) -> Literal["finish", "classify"]:
+    return "finish" if state.get("action_result") else "classify"
+
+
+async def _node_finalize_crm_action(state: AgentGraphState) -> AgentGraphState:
+    return _action_response(state, "crm_action_fast_path")
+
+
+async def _node_classify(state: AgentGraphState) -> AgentGraphState:
+    classification = await classify_intent(state["query"], state["memory"])
+    return {**state, "classification": classification.to_dict()}
+
+
+async def _node_crm_classified_path(state: AgentGraphState) -> AgentGraphState:
+    classification_data = state.get("classification") or {}
+    if classification_data.get("crm_action") and classification_data.get("primary_agent") == "crm":
+        action_result = await _try_crm_action(state["user"], state["query"])
         if action_result:
-            return {
-                "response": action_result["response"],
-                "agent": "crm",
-                "intent": classification.intent,
-                "citations": citations,
-                "context": {
-                    "user_id": user.id,
-                    "memory": memory,
-                    "classification": classification.to_dict(),
-                    "action": action_result.get("action"),
-                    "success": action_result.get("success"),
-                    "routing": "classified_crm_action",
-                },
-                "actions": [action_result.get("action")] if action_result.get("action") else [],
-            }
+            return _action_response({**state, "action_result": action_result}, "classified_crm_action")
+    return state
+
+
+def _route_after_classified_crm(state: AgentGraphState) -> Literal["finish", "route_agent"]:
+    if state.get("action_result"):
+        return "finish"
+    return "route_agent"
+
+
+async def _node_route_agent(state: AgentGraphState) -> AgentGraphState:
+    cd = state.get("classification") or {}
+    classification = IntentClassification(
+        intent=cd.get("intent", "general"),
+        primary_agent=cd.get("primary_agent", "router"),
+        requires=cd.get("requires", []),
+        entities=cd.get("entities", {}),
+        confidence=cd.get("confidence", {}),
+        crm_action=cd.get("crm_action"),
+        reasoning=cd.get("reasoning", ""),
+    )
+    user = state["user"]
+    query = state["query"]
+    memory = state["memory"]
 
     orchestration = await _gather_orchestration_context(user, query, classification, memory)
     agent = classification.primary_agent
     intent = classification.intent
+    citations: List[Dict[str, Any]] = []
+    actions: List[str] = []
 
     if agent == "crm":
         response = await _run_crm_agent(user, query, memory)
-
     elif agent == "meeting":
         response = await _run_meeting_agent(user, query, classification)
-
     elif agent == "email":
         response = await _run_email_agent(user, query, classification, memory, orchestration)
-
     elif agent == "knowledge":
         response, citations = await _run_knowledge_agent(user, query)
-
     elif agent == "task":
         task_result = await _try_crm_action(user, query)
         if task_result:
             response = task_result["response"]
-            actions_taken = [task_result.get("action", "create_task")]
+            actions = [task_result.get("action", "create_task")]
         else:
             response = (
                 "📋 **Task Agent** — I can create tasks for you. Try:\n"
                 "*Create a task to call John tomorrow*"
             )
-
     elif agent == "analytics":
         response = await _run_analytics_agent(user)
-
     else:
         llm_response = await generate_completion(query, CRM_SYSTEM)
         response = (
@@ -293,17 +354,96 @@ async def run_agent_graph(user: User, query: str) -> Dict[str, Any]:
         agent = "router"
 
     return {
+        **state,
         "response": response,
         "agent": agent,
         "intent": intent,
         "citations": citations,
-        "context": {
-            "user_id": user.id,
-            "memory": memory,
-            "classification": classification.to_dict(),
-            "orchestration": orchestration,
-        },
-        "actions": actions_taken,
+        "orchestration": orchestration,
+        "actions": actions,
+        "routing": "classified_agent",
+    }
+
+
+def _build_agent_graph():
+    workflow = StateGraph(AgentGraphState)
+    workflow.add_node("prepare", _node_prepare)
+    workflow.add_node("crm_fast_path", _node_crm_fast_path)
+    workflow.add_node("finalize_crm_action", _node_finalize_crm_action)
+    workflow.add_node("classify", _node_classify)
+    workflow.add_node("crm_classified_path", _node_crm_classified_path)
+    workflow.add_node("route_agent", _node_route_agent)
+
+    workflow.add_edge(START, "prepare")
+    workflow.add_edge("prepare", "crm_fast_path")
+    workflow.add_conditional_edges(
+        "crm_fast_path",
+        _route_after_fast_path,
+        {"finish": "finalize_crm_action", "classify": "classify"},
+    )
+    workflow.add_edge("finalize_crm_action", END)
+    workflow.add_edge("classify", "crm_classified_path")
+    workflow.add_conditional_edges(
+        "crm_classified_path",
+        _route_after_classified_crm,
+        {"finish": "finalize_crm_action", "route_agent": "route_agent"},
+    )
+    workflow.add_edge("route_agent", END)
+    return workflow.compile()
+
+
+_agent_graph = None
+
+
+def get_agent_graph():
+    global _agent_graph
+    if _agent_graph is None:
+        _agent_graph = _build_agent_graph()
+    return _agent_graph
+
+
+async def run_agent_graph(user: User, query: str) -> Dict[str, Any]:
+    """Multi-agent router powered by LangGraph."""
+    graph = get_agent_graph()
+    result = await graph.ainvoke(
+        {
+            "user": user,
+            "query": query,
+            "effective_query": query,
+            "memory": {},
+            "classification": None,
+            "action_result": None,
+            "response": "",
+            "agent": "",
+            "intent": "",
+            "citations": [],
+            "orchestration": {},
+            "actions": [],
+            "routing": "",
+        }
+    )
+
+    context: Dict[str, Any] = {
+        "user_id": user.id,
+        "memory": result["memory"],
+    }
+    if result.get("classification"):
+        context["classification"] = result["classification"]
+    if result.get("orchestration"):
+        context["orchestration"] = result["orchestration"]
+    if result.get("action_result"):
+        context["action"] = result["action_result"].get("action")
+        context["success"] = result["action_result"].get("success")
+    if result.get("routing"):
+        context["routing"] = result["routing"]
+
+    return {
+        "response": result["response"],
+        "agent": result["agent"],
+        "intent": result["intent"],
+        "citations": result["citations"],
+        "context": context,
+        "actions": result["actions"],
     }
 
 

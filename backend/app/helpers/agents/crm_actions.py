@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from app.database.redis_client import cache_get, cache_set
 from app.helpers.workflow_engine import trigger_workflows_for_event
+from app.helpers.agents.crm_action_graph import run_crm_action_detection
 from app.helpers.agents.query_parser import (
     _clean_name,
     enrich_with_llm,
@@ -31,36 +32,6 @@ def _is_valid_customer_name(name: Optional[str]) -> bool:
     return True
 
 
-def _is_update_customer_query(q: str) -> bool:
-    if any(w in q for w in ("update", "set", "change", "edit")):
-        if any(w in q for w in ("phone", "email", "company", "customer")):
-            return True
-        if re.search(r"update\s+[\w\s'-]+[''']s\s+(phone|email|company)", q):
-            return True
-    has_fields = any(w in q for w in ("company", "email", "phone"))
-    if has_fields and re.search(r"for\s+(?:the\s+)?[\w\s'-]+\s+customer\b", q):
-        return True
-    if has_fields and re.search(r"\bfor\s+(?:the\s+)?[\w\s'-]+", q) and not re.search(
-        r"(?:create|add|new|register)\s+(?:a\s+)?(?:new\s+)?customer\b", q
-    ):
-        return True
-    return False
-
-
-def _is_delete_customer_query(q: str) -> bool:
-    if any(w in q for w in ("delete", "remove")) and "customer" in q:
-        return True
-    return bool(re.search(r"(?:delete|remove)\s+(?:the\s+)?customer\b", q))
-
-
-def _is_create_customer_query(q: str) -> bool:
-    if _is_update_customer_query(q) or _is_delete_customer_query(q):
-        return False
-    if re.search(r"(?:create|add|new|register)\s+(?:a\s+)?(?:new\s+)?customer\b", q):
-        return True
-    return bool(re.search(r"customer\s+(?:named|called)\s+", q))
-
-
 def is_confirmation(query: str) -> bool:
     q = query.strip().lower()
     return bool(
@@ -71,12 +42,15 @@ def is_confirmation(query: str) -> bool:
     )
 
 
-def is_crm_related(query: str) -> bool:
-    return detect_crm_action(query) is not None or _is_update_customer_query(query.lower()) or _is_delete_customer_query(query.lower())
+async def is_crm_related(query: str) -> bool:
+    result = await run_crm_action_detection(query)
+    return result.get("crm_action") is not None
 
 
 async def remember_pending_action(user_id: int, query: str) -> None:
-    if is_crm_related(query) and not is_confirmation(query):
+    if is_confirmation(query):
+        return
+    if await is_crm_related(query):
         await cache_set(PENDING_ACTION_KEY.format(user_id=user_id), query, ttl=3600)
 
 
@@ -89,27 +63,10 @@ async def clear_pending_action(user_id: int) -> None:
     await cache_set(PENDING_ACTION_KEY.format(user_id=user_id), "", ttl=1)
 
 
-def detect_crm_action(query: str) -> Optional[str]:
-    q = query.lower()
-    if _is_delete_customer_query(q):
-        return "delete_customer"
-    if _is_update_customer_query(q):
-        return "update_customer"
-    if _is_create_customer_query(q):
-        return "create_customer"
-    if any(w in q for w in ("create", "add", "new")) and "lead" in q:
-        return "create_lead"
-    if any(w in q for w in ("create", "add", "new")) and "deal" in q:
-        return "create_deal"
-    if any(w in q for w in ("create", "add", "new")) and "task" in q:
-        return "create_task"
-    if any(w in q for w in ("latest", "recent", "newest", "last")) and "customer" in q:
-        return "latest_customer"
-    if any(w in q for w in ("list", "show", "get", "all")) and "customer" in q:
-        return "list_customers"
-    if any(w in q for w in ("how many", "count", "total")) and "customer" in q:
-        return "count_customers"
-    return None
+async def detect_crm_action_async(query: str) -> Optional[str]:
+    """LangGraph + LangChain structured classification."""
+    result = await run_crm_action_detection(query)
+    return result.get("crm_action")
 
 
 def _score_customer_match(name_lower: str, customer_name: str) -> int:
@@ -185,10 +142,13 @@ def _customer_response(customer: Customer, heading: str) -> str:
 
 
 async def execute_crm_action(user: User, query: str) -> Optional[Dict[str, Any]]:
-    action = detect_crm_action(query)
+    action = await detect_crm_action_async(query)
     if not action:
         return None
+    return await _execute_crm_action(user, query, action)
 
+
+async def _execute_crm_action(user: User, query: str, action: str) -> Optional[Dict[str, Any]]:
     if action == "delete_customer":
         customer = await _resolve_customer(user, query)
         if not customer:
@@ -331,7 +291,7 @@ async def execute_crm_action(user: User, query: str) -> Optional[Dict[str, Any]]
             "success": True,
             "entity": {"type": "lead", "id": lead.id, "name": lead.name},
             "response": (
-                f"✅ **Lead created**\n\n"
+                f" **Lead created**\n\n"
                 f"• **Name:** {lead.name}\n"
                 f"• **Company / Interest:** {lead.company or '—'}\n"
                 f"• **Source:** {lead.source or '—'}\n"
@@ -356,7 +316,7 @@ async def execute_crm_action(user: User, query: str) -> Optional[Dict[str, Any]]
             "success": True,
             "entity": {"type": "deal", "id": deal.id, "title": deal.title},
             "response": (
-                f"✅ **Deal created**\n\n"
+                f" **Deal created**\n\n"
                 f"• **Title:** {deal.title}\n"
                 f"• **Value:** ${float(deal.value or 0):,.2f}\n"
                 f"• **Stage:** {deal.stage}\n"

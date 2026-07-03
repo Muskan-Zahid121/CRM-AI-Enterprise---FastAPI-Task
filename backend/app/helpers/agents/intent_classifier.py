@@ -8,7 +8,6 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from app.config import settings
-from app.helpers.agents.crm_actions import detect_crm_action
 from app.helpers.llm.provider import generate_json_completion
 from app.helpers.prompts import INTENT_CLASSIFIER_SYSTEM
 
@@ -119,7 +118,7 @@ def _parse_classification(data: Dict[str, Any], query: str) -> IntentClassificat
     requires = _normalize_requires(data.get("requires"))
     entities = _normalize_entities(data.get("entities"))
     confidence = _normalize_confidence(data.get("confidence"))
-    crm_action = data.get("crm_action") or detect_crm_action(query)
+    crm_action = data.get("crm_action")
     if crm_action:
         crm_action = str(crm_action)
     reasoning = str(data.get("reasoning") or "").strip()
@@ -146,18 +145,6 @@ def _fallback_classify(query: str, memory: Optional[Dict[str, Any]] = None) -> I
     memory = memory or {}
     entities: Dict[str, str] = {}
     requires: List[str] = []
-
-    crm_action = detect_crm_action(query)
-    if crm_action:
-        return IntentClassification(
-            intent=crm_action,
-            primary_agent="crm",
-            requires=[],
-            entities=entities,
-            confidence={"crm": 0.95},
-            crm_action=crm_action,
-            reasoning="Explicit CRM mutation detected.",
-        )
 
     email_patterns = (
         r"\b(write|draft|compose|send)\b.*\b(email|e-mail)\b",

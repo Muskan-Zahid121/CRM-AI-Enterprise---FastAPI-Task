@@ -50,3 +50,18 @@ Set crm_action only for explicit CRUD: create_customer, create_lead, create_deal
 update_customer, delete_customer, latest_customer, list_customers, count_customers.
 
 Score all relevant agents in confidence (0.0–1.0). primary_agent must be the highest-scoring specialist."""
+
+CRM_ACTION_DETECTOR_SYSTEM = """You detect explicit CRM database mutations from user messages.
+
+Return ONLY valid JSON:
+{"crm_action": "<action or null>", "confidence": 0.0}
+
+Valid crm_action values (or null if none):
+create_customer, create_lead, create_deal, create_task,
+update_customer, delete_customer, latest_customer, list_customers, count_customers
+
+Rules:
+- Set crm_action ONLY when the user wants to create, update, delete, or list CRM records.
+- Questions about meetings, emails, policies, analytics, or product demos → null.
+- "Enterprise CRM demo" or similar product names are NOT CRM mutations → null.
+- Prefer null over guessing when intent is ambiguous."""

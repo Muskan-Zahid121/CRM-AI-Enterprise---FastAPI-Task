@@ -23,8 +23,17 @@ export default function ContactsPage() {
   const [email, setEmail] = useState('');
   const [title, setTitle] = useState('');
   const [error, setError] = useState('');
+  const [fieldErrors, setFieldErrors] = useState<{ name?: string; email?: string }>({});
   const [loading, setLoading] = useState(false);
   const [deletingId, setDeletingId] = useState<number | null>(null);
+
+  function validate() {
+    const next: { name?: string; email?: string } = {};
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!name.trim()) next.name = 'Full name is required';
+    if (email.trim() && !emailRegex.test(email.trim())) next.email = 'Please enter a valid email address';
+    return next;
+  }
 
   async function load() {
     const res = await platformApi.listContacts();
@@ -35,6 +44,10 @@ export default function ContactsPage() {
 
   async function handleCreate(e: FormEvent) {
     e.preventDefault();
+    const nextErrors = validate();
+    setFieldErrors(nextErrors);
+    if (Object.keys(nextErrors).length > 0) return;
+
     setLoading(true);
     setError('');
     try {
@@ -70,9 +83,38 @@ export default function ContactsPage() {
       <PageHeader title="Contacts" subtitle="People linked to your customer accounts" />
       <AlertBanner message={error} onDismiss={() => setError('')} />
 
-      <form onSubmit={handleCreate} className="card-surface mb-6 grid gap-3 p-5 md:grid-cols-5">
-        <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Full name" required className="input-dark" />
-        <input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="Email" type="email" className="input-dark" />
+      <form onSubmit={handleCreate} noValidate className="card-surface mb-6 grid gap-3 p-5 md:grid-cols-5">
+        <div>
+          <input
+            value={name}
+            onChange={(e) => {
+              setName(e.target.value);
+              if (fieldErrors.name) setFieldErrors((prev) => ({ ...prev, name: undefined }));
+            }}
+            placeholder="Full name"
+            aria-invalid={Boolean(fieldErrors.name)}
+            className={`input-dark w-full ${fieldErrors.name ? 'border-red-400/60 focus:border-red-400' : ''}`}
+          />
+          {fieldErrors.name && (
+            <p className="mt-1 text-xs text-red-400" role="alert">{fieldErrors.name}</p>
+          )}
+        </div>
+        <div>
+          <input
+            value={email}
+            onChange={(e) => {
+              setEmail(e.target.value);
+              if (fieldErrors.email) setFieldErrors((prev) => ({ ...prev, email: undefined }));
+            }}
+            placeholder="Email"
+            type="email"
+            aria-invalid={Boolean(fieldErrors.email)}
+            className={`input-dark w-full ${fieldErrors.email ? 'border-red-400/60 focus:border-red-400' : ''}`}
+          />
+          {fieldErrors.email && (
+            <p className="mt-1 text-xs text-red-400" role="alert">{fieldErrors.email}</p>
+          )}
+        </div>
         <input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Job title" className="input-dark md:col-span-2" />
         <LoadingButton type="submit" loading={loading} loadingText="Saving...">Add Contact</LoadingButton>
       </form>
